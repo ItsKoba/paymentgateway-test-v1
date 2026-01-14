@@ -9,7 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
-import { formatCurrency, formatDate, type Deposit } from "@/lib/api";
+import { formatCurrency, formatDate, createDeposit, checkDeposit, type Deposit } from "@/lib/api";
 import {
   CreditCard,
   Wallet,
@@ -41,8 +41,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-
-const KOBARU_API_BASE = "https://kobaru-api.vercel.app/api/v1";
 
 export default function Dashboard() {
   const { user, profile, loading, signOut, refreshProfile, regenerateCredentials } = useAuth();
@@ -104,51 +102,24 @@ export default function Dashboard() {
     setIsCreatingDeposit(true);
 
     try {
-      const refId = `USR_${user?.id.substring(0, 8)}_${Date.now()}`;
+      // Call edge function (which calls Kobaru API)
+      const response = await createDeposit(profile.api_id, profile.api_key, amount);
 
-      // Call Kobaru API directly
-      const kobaruResponse = await fetch(`${KOBARU_API_BASE}/deposits`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ref_id: refId, amount }),
-      });
-
-      if (!kobaruResponse.ok) {
-        throw new Error("Failed to create deposit");
+      if (response.status === "error") {
+        throw new Error(response.message || "Failed to create deposit");
       }
 
-      const depositData = await kobaruResponse.json();
-      const expiresAt = new Date(Date.now() + 3 * 60 * 60 * 1000);
+      if (response.data) {
+        setNewDeposit(response.data as Deposit);
+        setShowQrDialog(true);
+        setDepositAmount("");
+        fetchDeposits();
 
-      // Save to database
-      const { data: savedDeposit, error: insertError } = await supabase
-        .from("user_deposits")
-        .insert({
-          user_id: user?.id,
-          ref_id: depositData.ref_id,
-          amount: amount,
-          final_amount: depositData.amount,
-          qr_string: depositData.qr_string,
-          qr_image: depositData.qr_image,
-          status: "unpaid",
-          expires_at: expiresAt.toISOString(),
-        })
-        .select()
-        .single();
-
-      if (insertError) {
-        throw new Error("Failed to save deposit");
+        toast({
+          title: "Deposit berhasil dibuat",
+          description: `Silakan bayar ${formatCurrency(response.data.final_amount)}`,
+        });
       }
-
-      setNewDeposit(savedDeposit as Deposit);
-      setShowQrDialog(true);
-      setDepositAmount("");
-      fetchDeposits();
-
-      toast({
-        title: "Deposit berhasil dibuat",
-        description: `Silakan bayar ${formatCurrency(depositData.amount)}`,
-      });
     } catch (error) {
       toast({
         title: "Gagal membuat deposit",
@@ -161,27 +132,15 @@ export default function Dashboard() {
   };
 
   const handleCheckDeposit = async (deposit: Deposit) => {
+    if (!profile) return;
     setCheckingDeposit(deposit.ref_id);
 
     try {
-      const kobaruResponse = await fetch(
-        `${KOBARU_API_BASE}/deposits?ref_id=${encodeURIComponent(deposit.ref_id)}`
-      );
+      // Call edge function (which checks with Kobaru API and updates database)
+      const response = await checkDeposit(profile.api_id, profile.api_key, deposit.ref_id);
 
-      if (kobaruResponse.ok) {
-        const kobaruData = await kobaruResponse.json();
-
-        if (kobaruData.status === "paid" && deposit.status !== "paid") {
-          await supabase
-            .from("user_deposits")
-            .update({ status: "paid", paid_at: new Date().toISOString() })
-            .eq("id", deposit.id);
-
-          await supabase.rpc("add_user_balance", {
-            p_user_id: user?.id,
-            p_amount: deposit.final_amount,
-          });
-
+      if (response.status === "success" && response.data) {
+        if (response.data.status === "paid" && deposit.status !== "paid") {
           await refreshProfile();
           fetchDeposits();
 
@@ -189,25 +148,19 @@ export default function Dashboard() {
             title: "Pembayaran diterima!",
             description: `Saldo Anda bertambah ${formatCurrency(deposit.final_amount)}`,
           });
-        } else if (kobaruData.status === "unpaid") {
+        } else if (response.data.status === "expired") {
+          fetchDeposits();
+          toast({
+            title: "Deposit expired",
+            description: "Silakan buat deposit baru",
+            variant: "destructive",
+          });
+        } else if (response.data.status === "unpaid") {
           toast({
             title: "Belum dibayar",
             description: "Deposit masih menunggu pembayaran",
           });
         }
-      } else if (kobaruResponse.status === 410) {
-        await supabase
-          .from("user_deposits")
-          .update({ status: "expired" })
-          .eq("id", deposit.id);
-
-        fetchDeposits();
-
-        toast({
-          title: "Deposit expired",
-          description: "Silakan buat deposit baru",
-          variant: "destructive",
-        });
       }
     } catch (error) {
       toast({
